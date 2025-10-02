@@ -3,11 +3,15 @@ import requests
 from fastapi import FastAPI
 from pydantic import BaseModel
 from google.cloud import bigquery
+from dotenv import load_dotenv
+
+# Cargar variables del archivo .env
+load_dotenv()
 
 # Inicializar FastAPI
 app = FastAPI()
 
-# Configuración
+# Configuración desde .env
 PROJECT_ID = os.getenv("PROJECT_ID")
 DATASET = os.getenv("DATASET", "vector_db")
 TABLE_EMBEDDINGS = os.getenv("TABLE_EMBEDDINGS", "t_embeddings_prueba")
