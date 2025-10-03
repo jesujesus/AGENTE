@@ -5,7 +5,7 @@ import pandas as pd
 import fitz
 import requests
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from google.cloud import storage, bigquery, documentai
 
@@ -28,11 +28,11 @@ TABLE_CONTROL = os.getenv("TABLE_CONTROL", "t_files_control_prueba")
 PROCESSOR_ID = os.getenv("PROCESSOR_ID")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/embedding-001:embedContent?key={GEMINI_API_KEY}"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/embedding-001:batchEmbedContents?key={GEMINI_API_KEY}"
 
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", 200))  # 🚀 configurable
-REDUCIR_DIM = True
-DIM = 10
+REDUCIR_DIM = os.getenv("REDUCIR_DIM", "False").lower() == "true"
+DIM = int(os.getenv("DIM", 768))  # default full dimension
 
 # Clientes GCP
 storage_client = storage.Client(project=PROJECT_ID)
@@ -193,7 +193,7 @@ def registrar_control(file_name, file_hash, status, categoria, proceso, producto
     row = [{
         "file_name": file_name,
         "file_hash": file_hash,
-        "processed_at": datetime.utcnow().isoformat(),
+        "processed_at": datetime.now(timezone.utc).isoformat(),
         "status": status,
         "categoria": categoria,
         "proceso": proceso,
@@ -205,54 +205,50 @@ def registrar_control(file_name, file_hash, status, categoria, proceso, producto
         print(f"⚠️ Error registrando control: {errors}")
 
 # ==========================
-# EMBEDDINGS (batch seguro)
+# EMBEDDINGS (batch Gemini)
 # ==========================
 def embed_and_insert(chunks, file_name, file_hash, ruta, categoria, proceso, producto):
     if not GEMINI_API_KEY:
         print("❌ No se generarán embeddings: falta GEMINI_API_KEY.")
         return
 
-    rows = []
-    for idx, chunk in enumerate(chunks):
+    for i in range(0, len(chunks), BATCH_SIZE):
+        batch = chunks[i:i+BATCH_SIZE]
         payload = {
-            "model": "models/embedding-001",
-            "content": {"parts": [{"text": chunk}]}
+            "requests": [{"model": "models/embedding-001", "content": {"parts": [{"text": ch}]}} for ch in batch]
         }
+
         try:
             resp = requests.post(GEMINI_URL, json=payload, timeout=30)
-            if not resp.ok:
-                print(f"⚠️ Error Gemini HTTP {resp.status_code}: {resp.text}")
-                continue
-
+            resp.raise_for_status()
             data = resp.json()
-            emb = data.get("embedding", {}).get("values")
-            if not emb:
-                continue
-            if REDUCIR_DIM:
-                emb = emb[:DIM]
 
-            rows.append({
-                "id": f"{file_name}_{idx}",
-                "texto": chunk,
-                "embedding": emb,
-                "file_hash": file_hash,
-                "fuente": file_name,
-                "processed_at": datetime.utcnow().isoformat(),
-                "ruta": ruta,
-                "categoria": categoria,
-                "proceso": proceso,
-                "producto": producto
-            })
-        except Exception as e:
-            print(f"⚠️ Error llamando a Gemini: {e}")
-
-        # Inserción por lotes
-        if len(rows) >= BATCH_SIZE:
-            _insert_embeddings(rows, file_name)
             rows = []
+            for j, emb_data in enumerate(data.get("embeddings", [])):
+                emb = emb_data.get("values")
+                if not emb:
+                    continue
+                if REDUCIR_DIM:
+                    emb = emb[:DIM]
 
-    if rows:
-        _insert_embeddings(rows, file_name)
+                rows.append({
+                    "id": f"{file_name}_{i+j}",
+                    "texto": batch[j],
+                    "embedding": emb,
+                    "file_hash": file_hash,
+                    "fuente": file_name,
+                    "processed_at": datetime.now(timezone.utc).isoformat(),
+                    "ruta": ruta,
+                    "categoria": categoria,
+                    "proceso": proceso,
+                    "producto": producto
+                })
+
+            if rows:
+                _insert_embeddings(rows, file_name)
+
+        except Exception as e:
+            print(f"⚠️ Error batch Gemini: {e}")
 
 def _insert_embeddings(rows, file_name):
     table_id = f"{PROJECT_ID}.{DATASET}.{TABLE_EMBEDDINGS}"
