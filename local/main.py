@@ -5,6 +5,7 @@ import pandas as pd
 import fitz
 import requests
 import tempfile
+import json
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from google.cloud import storage, bigquery, documentai
@@ -40,12 +41,11 @@ bq_client = bigquery.Client(project=PROJECT_ID)
 docai_client = documentai.DocumentProcessorServiceClient()
 
 # ==========================
-# CREACIÓN/VALIDACIÓN DE INFRA (una sola vez)
+# CREACIÓN/VALIDACIÓN DE TABLAS
 # ==========================
 def crear_tablas_si_no_existen():
     dataset_ref = bq_client.dataset(DATASET, project=PROJECT_ID)
 
-    # Dataset
     try:
         bq_client.get_dataset(dataset_ref)
         print(f"✅ Dataset '{DATASET}' validado.")
@@ -59,9 +59,6 @@ def crear_tablas_si_no_existen():
         bigquery.SchemaField("file_hash", "STRING"),
         bigquery.SchemaField("processed_at", "TIMESTAMP"),
         bigquery.SchemaField("status", "STRING"),
-        bigquery.SchemaField("categoria", "STRING"),
-        bigquery.SchemaField("proceso", "STRING"),
-        bigquery.SchemaField("producto", "STRING"),
         bigquery.SchemaField("ruta", "STRING"),
     ]
     try:
@@ -79,11 +76,9 @@ def crear_tablas_si_no_existen():
         bigquery.SchemaField("embedding", "FLOAT", mode="REPEATED"),
         bigquery.SchemaField("file_hash", "STRING"),
         bigquery.SchemaField("fuente", "STRING"),
-        bigquery.SchemaField("processed_at", "TIMESTAMP"),
         bigquery.SchemaField("ruta", "STRING"),
-        bigquery.SchemaField("categoria", "STRING"),
-        bigquery.SchemaField("proceso", "STRING"),
-        bigquery.SchemaField("producto", "STRING"),
+        bigquery.SchemaField("processed_at", "TIMESTAMP"),
+        bigquery.SchemaField("metadata", "STRING"),  # JSON serializado
     ]
     try:
         bq_client.get_table(table_embeddings_id)
@@ -130,11 +125,10 @@ def chunk_text(text, max_size=500, overlap=50):
     if current:
         chunks.append(current.strip())
 
-    # Overlap
     if overlap > 0 and len(chunks) > 1:
         out = []
         for i, ch in enumerate(chunks):
-            if i == 0: 
+            if i == 0:
                 out.append(ch)
             else:
                 prev = out[-1]
@@ -188,16 +182,13 @@ def archivo_ya_procesado(file_hash):
     results = bq_client.query(query, job_config=job_config).result()
     return any(row["status"] == "OK" for row in results)
 
-def registrar_control(file_name, file_hash, status, categoria, proceso, producto, ruta):
+def registrar_control(file_name, file_hash, status, ruta):
     table_id = f"{PROJECT_ID}.{DATASET}.{TABLE_CONTROL}"
     row = [{
         "file_name": file_name,
         "file_hash": file_hash,
         "processed_at": datetime.now(timezone.utc).isoformat(),
         "status": status,
-        "categoria": categoria,
-        "proceso": proceso,
-        "producto": producto,
         "ruta": ruta
     }]
     errors = bq_client.insert_rows_json(table_id, row)
@@ -207,7 +198,7 @@ def registrar_control(file_name, file_hash, status, categoria, proceso, producto
 # ==========================
 # EMBEDDINGS (batch Gemini)
 # ==========================
-def embed_and_insert(chunks, file_name, file_hash, ruta, categoria, proceso, producto):
+def embed_and_insert(chunks, file_name, file_hash, ruta, categoria, proceso, producto, nivel_proceso, mime_type="application/pdf", page_count=None):
     if not GEMINI_API_KEY:
         print("❌ No se generarán embeddings: falta GEMINI_API_KEY.")
         return
@@ -231,32 +222,42 @@ def embed_and_insert(chunks, file_name, file_hash, ruta, categoria, proceso, pro
                 if REDUCIR_DIM:
                     emb = emb[:DIM]
 
+                metadata = {
+                    "source_uri": f"gs://{BUCKET_NAME}/{ruta}",
+                    "mime_type": mime_type,
+                    "page_count": page_count,
+                    "page_number": j+1,
+                    "chunk_type": "paragraph",
+                    "categoria": categoria,
+                    "proceso": proceso,
+                    "producto": producto,
+                    "nivel_proceso": nivel_proceso
+                }
+
                 rows.append({
                     "id": f"{file_name}_{i+j}",
                     "texto": batch[j],
                     "embedding": emb,
                     "file_hash": file_hash,
                     "fuente": file_name,
-                    "processed_at": datetime.now(timezone.utc).isoformat(),
                     "ruta": ruta,
-                    "categoria": categoria,
-                    "proceso": proceso,
-                    "producto": producto
+                    "processed_at": datetime.now(timezone.utc).isoformat(),
+                    "metadata": json.dumps(metadata)
                 })
 
             if rows:
-                _insert_embeddings(rows, file_name)
+                _insert_embeddings(rows, file_name, file_hash)
 
         except Exception as e:
             print(f"⚠️ Error batch Gemini: {e}")
 
-def _insert_embeddings(rows, file_name):
+def _insert_embeddings(rows, file_name, file_hash):
     table_id = f"{PROJECT_ID}.{DATASET}.{TABLE_EMBEDDINGS}"
     errors = bq_client.insert_rows_json(table_id, rows)
     if errors:
         print("⚠️ Errores insertando embeddings en BigQuery:", errors)
     else:
-        print(f"✅ Insertados {len(rows)} embeddings de {file_name}")
+        print(f"✅ Insertados {len(rows)} embeddings de {file_name} (hash={file_hash})")
 
 # ==========================
 # PIPELINE PRINCIPAL
@@ -264,7 +265,7 @@ def _insert_embeddings(rows, file_name):
 def process_file(file_path, file_name, ruta_gcs, processor_id=PROCESSOR_ID):
     file_type = validar_archivo(file_path)
     if not file_type:
-        registrar_control(file_name, "N/A", "ERROR", "desconocido", "desconocido", "general", ruta_gcs)
+        registrar_control(file_name, "N/A", "ERROR", ruta_gcs)
         return
 
     file_hash = calcular_hash(file_path)
@@ -272,43 +273,42 @@ def process_file(file_path, file_name, ruta_gcs, processor_id=PROCESSOR_ID):
         print(f"ℹ️ {file_name} ya fue procesado. Saltando…")
         return
 
-    categoria, proceso, producto, ruta = "general", "general", "general", ruta_gcs
-    texto = ""
+    categoria, proceso, producto, nivel_proceso = "general", "general", "general", "general"
+    texto, mime_type, page_count = "", None, None
 
     try:
         if file_type == "pdf":
             texto = extract_text_from_pdf(file_path)
-            if len(texto.strip()) < 50 and processor_id:
-                texto = extract_with_docai(file_path, "application/pdf", processor_id)
-
+            mime_type = "application/pdf"
         elif file_type == "imagen" and processor_id:
             mime_type = "image/jpeg" if file_path.endswith(('.jpg', '.jpeg')) else "image/png"
             texto = extract_with_docai(file_path, mime_type, processor_id)
-
         elif file_type == "tabla":
             if file_path.endswith(".csv"):
-                 texto = process_csv(file_path)
-            else:  # XLSX
+                texto = process_csv(file_path)
+                mime_type = "text/csv"
+            else:
                 df = pd.read_excel(file_path)
                 frases = []
                 for _, row in df.iterrows():
                     frases.append(" | ".join([f"{col}: {row[col]}" for col in df.columns]))
                 texto = "\n".join(frases)
-
+                mime_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         elif file_type == "texto":
             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                 texto = f.read()
+            mime_type = "text/plain"
 
         if texto.strip():
             chunks = chunk_text(texto, max_size=500, overlap=50)
-            embed_and_insert(chunks, file_name, file_hash, ruta, categoria, proceso, producto)
-            registrar_control(file_name, file_hash, "OK", categoria, proceso, producto, ruta)
+            embed_and_insert(chunks, file_name, file_hash, ruta_gcs, categoria, proceso, producto, nivel_proceso, mime_type, page_count)
+            registrar_control(file_name, file_hash, "OK", ruta_gcs)
         else:
-            registrar_control(file_name, file_hash, "SIN_TEXTO", categoria, proceso, producto, ruta)
+            registrar_control(file_name, file_hash, "SIN_TEXTO", ruta_gcs)
 
     except Exception as e:
         print(f"❌ Error procesando {file_name}: {e}")
-        registrar_control(file_name, file_hash, "ERROR", categoria, proceso, producto, ruta)
+        registrar_control(file_name, file_hash, "ERROR", ruta_gcs)
 
 # ==========================
 # CLOUD FUNCTION ENTRYPOINT
