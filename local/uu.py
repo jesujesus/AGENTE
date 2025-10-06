@@ -29,12 +29,11 @@ TABLE_CONTROL = os.getenv("TABLE_CONTROL", "t_files_control_prueba")
 PROCESSOR_ID = os.getenv("PROCESSOR_ID")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-# 🔹 Corregido: URL correcta con googleapis.com
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/embedding-001:batchEmbedContents?key={GEMINI_API_KEY}"
 
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", 200))  # 🚀 configurable
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", 200))
 REDUCIR_DIM = os.getenv("REDUCIR_DIM", "False").lower() == "true"
-DIM = int(os.getenv("DIM", 768))  # default full dimension
+DIM = int(os.getenv("DIM", 768))
 
 # Clientes GCP
 storage_client = storage.Client(project=PROJECT_ID)
@@ -79,7 +78,7 @@ def crear_tablas_si_no_existen():
         bigquery.SchemaField("fuente", "STRING"),
         bigquery.SchemaField("ruta", "STRING"),
         bigquery.SchemaField("processed_at", "TIMESTAMP"),
-        bigquery.SchemaField("metadata", "STRING"),  # JSON serializado
+        bigquery.SchemaField("metadata", "STRING"),
     ]
     try:
         bq_client.get_table(table_embeddings_id)
@@ -139,14 +138,50 @@ def chunk_text(text, max_size=500, overlap=50):
     return chunks
 
 # ==========================
-# EXTRACCIÓN DE TEXTO
+# EXTRACCIÓN DE TEXTO / CHUNKS
 # ==========================
-def extract_text_from_pdf(path):
-    texto = ""
+def extract_chunks_from_pdf(path, processor_id=None):
+    chunks = []
     with fitz.open(path) as doc:
-        for page in doc:
-            texto += page.get_text()
-    return texto
+        page_count = len(doc)
+        for page_number, page in enumerate(doc, start=1):
+            texto = page.get_text("text")
+            if texto.strip():
+                for ch in chunk_text(texto):
+                    chunks.append({
+                        "texto": ch,
+                        "chunk_type": "paragraph",
+                        "page_number": page_number,
+                        "page_count": page_count
+                    })
+
+            # Imágenes con OCR
+            for img_index, img in enumerate(page.get_images(full=True), start=1):
+                xref = img[0]
+                try:
+                    pix = fitz.Pixmap(doc, xref)
+                    if pix.n > 4:
+                        pix = fitz.Pixmap(fitz.csRGB, pix)
+                    img_path = os.path.join(tempfile.gettempdir(), f"page{page_number}_img{img_index}.png")
+                    pix.save(img_path)
+
+                    texto_ocr = ""
+                    if processor_id:
+                        try:
+                            texto_ocr = extract_with_docai(img_path, "image/png", processor_id)
+                        except Exception as e:
+                            print(f"⚠️ Error OCR en página {page_number}, imagen {img_index}: {e}")
+
+                    chunk_type = "image_ocr" if texto_ocr.strip() else "image"
+                    chunks.append({
+                        "texto": texto_ocr.strip(),
+                        "chunk_type": chunk_type,
+                        "page_number": page_number,
+                        "page_count": page_count
+                    })
+                except Exception as e:
+                    print(f"⚠️ No se pudo procesar imagen en página {page_number}: {e}")
+    return chunks
 
 def extract_with_docai(path, mime_type, processor_id):
     with open(path, "rb") as f:
@@ -164,7 +199,7 @@ def process_csv(path):
     frases = []
     for _, row in df.iterrows():
         frases.append(" | ".join([f"{col}: {row[col]}" for col in df.columns]))
-    return "\n".join(frases)
+    return frases
 
 # ==========================
 # BIGQUERY HELPERS
@@ -197,7 +232,7 @@ def registrar_control(file_name, file_hash, status, ruta):
         print(f"⚠️ Error registrando control: {errors}")
 
 # ==========================
-# EMBEDDINGS (batch Gemini)
+# EMBEDDINGS
 # ==========================
 def embed_and_insert(chunks, file_name, file_hash, ruta, categoria, proceso, producto, nivel_proceso, mime_type="application/pdf", page_count=None):
     if not GEMINI_API_KEY:
@@ -207,7 +242,7 @@ def embed_and_insert(chunks, file_name, file_hash, ruta, categoria, proceso, pro
     for i in range(0, len(chunks), BATCH_SIZE):
         batch = chunks[i:i+BATCH_SIZE]
         payload = {
-            "requests": [{"model": "models/embedding-001", "content": {"parts": [{"text": ch}]}} for ch in batch]
+            "requests": [{"model": "models/embedding-001", "content": {"parts": [{"text": ch['texto']} ]}} for ch in batch]
         }
 
         try:
@@ -223,12 +258,13 @@ def embed_and_insert(chunks, file_name, file_hash, ruta, categoria, proceso, pro
                 if REDUCIR_DIM:
                     emb = emb[:DIM]
 
+                ch = batch[j]
                 metadata = {
                     "source_uri": f"gs://{BUCKET_NAME}/{ruta}",
                     "mime_type": mime_type,
-                    "page_count": page_count,
-                    "page_number": j+1,
-                    "chunk_type": "paragraph",
+                    "page_count": ch.get("page_count", page_count),
+                    "page_number": ch.get("page_number"),
+                    "chunk_type": ch.get("chunk_type", "paragraph"),
                     "categoria": categoria,
                     "proceso": proceso,
                     "producto": producto,
@@ -237,7 +273,7 @@ def embed_and_insert(chunks, file_name, file_hash, ruta, categoria, proceso, pro
 
                 rows.append({
                     "id": f"{file_name}_{i+j}",
-                    "texto": batch[j],
+                    "texto": ch["texto"],
                     "embedding": emb,
                     "file_hash": file_hash,
                     "fuente": file_name,
@@ -275,34 +311,40 @@ def process_file(file_path, file_name, ruta_gcs, processor_id=PROCESSOR_ID):
         return
 
     categoria, proceso, producto, nivel_proceso = "general", "general", "general", "general"
-    texto, mime_type, page_count = "", None, None
+    mime_type, page_count = None, None
+    chunks = []
 
     try:
         if file_type == "pdf":
-            texto = extract_text_from_pdf(file_path)
+            chunks = extract_chunks_from_pdf(file_path, processor_id)
             mime_type = "application/pdf"
+
         elif file_type == "imagen" and processor_id:
             mime_type = "image/jpeg" if file_path.endswith(('.jpg', '.jpeg')) else "image/png"
             texto = extract_with_docai(file_path, mime_type, processor_id)
+            chunk_type = "image_ocr" if texto.strip() else "image"
+            chunks.append({"texto": texto, "chunk_type": chunk_type, "page_number": 1, "page_count": 1})
+
         elif file_type == "tabla":
             if file_path.endswith(".csv"):
-                texto = process_csv(file_path)
+                filas = process_csv(file_path)
                 mime_type = "text/csv"
             else:
                 df = pd.read_excel(file_path)
-                frases = []
-                for _, row in df.iterrows():
-                    frases.append(" | ".join([f"{col}: {row[col]}" for col in df.columns]))
-                texto = "\n".join(frases)
+                filas = [" | ".join([f"{col}: {row[col]}" for col in df.columns]) for _, row in df.iterrows()]
                 mime_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            for f in filas:
+                chunks.append({"texto": f, "chunk_type": "table", "page_number": 1, "page_count": 1})
+
         elif file_type == "texto":
             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                 texto = f.read()
             mime_type = "text/plain"
+            for ch in chunk_text(texto):
+                chunks.append({"texto": ch, "chunk_type": "paragraph", "page_number": 1, "page_count": 1})
 
-        if texto.strip():
-            chunks = chunk_text(texto, max_size=500, overlap=50)
-            embed_and_insert(chunks, file_name, file_hash, ruta_gcs, categoria, proceso, producto, nivel_proceso, mime_type, page_count)
+        if chunks:
+            embed_and_insert(chunks, file_name, file_hash, ruta_gcs, categoria, proceso, producto, nivel_proceso, mime_type)
             registrar_control(file_name, file_hash, "OK", ruta_gcs)
         else:
             registrar_control(file_name, file_hash, "SIN_TEXTO", ruta_gcs)
