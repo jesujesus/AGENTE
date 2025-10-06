@@ -1,0 +1,60 @@
+# ============================
+# 🚫 ARCHIVOS Y CARPETAS A IGNORAR
+# ============================
+
+# --- Entornos virtuales ---
+venv/
+.env/
+ENV/
+env/
+*.venv/
+
+# --- Archivos de configuración sensibles ---
+*.env
+*.ini
+*.json
+*.key
+*.pem
+*.crt
+*.log
+
+# --- Archivos de sistema ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Archivos compilados de Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- Configuración de VS Code ---
+.vscode/
+.history/
+
+# --- Archivos temporales ---
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# --- Dependencias y cache ---
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# --- Archivos de Docker ---
+*.pid
+*.tar
+*.lock
+
+# --- Archivos de Google Cloud y credenciales locales ---
+*.json
+gcloud/
+application_default_credentials.json
+
+# --- Archivos específicos de tu proyecto ---
+# (Evita subir configuraciones locales)
+local/
