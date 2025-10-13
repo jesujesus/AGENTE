@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+requests
+google-cloud-bigquery
+google-generativeai
+google-genai

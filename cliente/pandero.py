@@ -1,126 +1,97 @@
 import streamlit as st
 import requests
-import time
 from typing import Dict, Any, List
 
-# --- Configuración de la Interfaz ---
-st.set_page_config(
-    page_title="Agente Pandero IA",
-    layout="centered",
-    initial_sidebar_state="collapsed"
-)
+# =========================
+# Config básica
+# =========================
+st.set_page_config(page_title="Agente Pandero IA", layout="centered")
 
-# Definir el color azul principal de Pandero (ejemplo)
-PANDERO_BLUE = "#005BAA" # Azul oscuro profesional
-PANDERO_LIGHT_BLUE = "#E0F2FF" # Azul muy claro para fondos
+# Ajusta aquí si cambiaste el puerto del backend
+API_URL = "http://127.0.0.1:8080/ask"   # FastAPI en 8080
+#API_URL = "https://prize-nano-outstanding-handhelds.trycloudflare.com/ask"
+SIMULATION_MODE = False                  # True = sin backend, respuesta mock
 
-# Aplicar estilo CSS para el color principal y la fuente
-st.markdown(f"""
-    <style>
-        .stButton>button {{
-            background-color: {PANDERO_BLUE};
-            color: white;
-            font-weight: bold;
-            border-radius: 12px;
-            padding: 10px 20px;
-            border: none;
-            box-shadow: 2px 2px 5px rgba(0, 0, 0, 0.2);
-            transition: all 0.2s ease;
-        }}
-        .stButton>button:hover {{
-            background-color: #004D99; /* Azul ligeramente más oscuro al pasar el ratón */
-            transform: translateY(-1px);
-        }}
-        .stTextInput>div>div>input {{
-            border: 2px solid {PANDERO_BLUE};
-            border-radius: 10px;
-            padding: 10px;
-        }}
-        /* Estilo para el título */
-        .title-text {{
-            color: {PANDERO_BLUE};
-            font-weight: 800;
-        }}
-    </style>
-""", unsafe_allow_html=True)
+st.title("🤖 Agente Pandero IA (MVP)")
 
-# Encabezado
-st.markdown('<h1 class="title-text">🤖 Agente Pandero IA</h1>', unsafe_allow_html=True)
-st.markdown("Escribe tu pregunta para consultar información sobre productos financieros.")
-st.markdown("---")
 
-# --- Lógica de la Aplicación (Modo SIMULACIÓN) ---
+# =========================
+# Estado de sesión (historial)
+# =========================
+if "messages" not in st.session_state:
+    st.session_state.messages = []  # [{"role": "user"/"assistant", "content": str}, ...]
 
-# Bandera para activar/desactivar la simulación
-SIMULATION_MODE = True # Por defecto: SIMULACIÓN ACTIVA
-API_URL = "http://localhost:8000/ask"
-
+# =========================
+# Funciones auxiliares
+# =========================
 def mock_api_response(question: str) -> Dict[str, Any]:
-    """Simula una respuesta del backend sin hacer una llamada de red."""
-    time.sleep(1.5) # Simula un poco de latencia
-    
     return {
-        "respuesta": f"¡Hola! Gracias por preguntar sobre **'{question}'**. Como ejemplo, el financiamiento de Pandero para autos nuevos tiene un proceso de evaluación que dura aproximadamente 48 horas y requiere DNI, comprobante de ingresos y solicitud firmada. (Respuesta en modo SIMULACIÓN)",
-        "referencias": [
-            {
-                "titulo": "Procedimiento de Evaluación Crediticia - 2024",
-                "uri": "https://pandero.com/docs/evaluacion.pdf"
-            },
-            {
-                "titulo": "Requisitos Legales",
-                "uri": "https://pandero.com/requisitos.html"
-            }
-        ]
+        "respuesta": f"Demo: recibí tu pregunta «{question}». (SIMULACIÓN)",
+        "referencias": []
     }
 
-# Campo de entrada de texto para la pregunta del usuario
-question = st.text_input(
-    "**Haz tu pregunta:**",
-    placeholder="Ej: ¿Qué documentos necesito para un crédito de vehículo usado?"
-)
+def call_backend(question: str, history: List[Dict[str, str]]) -> Dict[str, Any]:
+    payload = {
+        "question": question,
+        "top_k": 3,
+        "temperature": 0.3,
+        "max_output_tokens": 2048,
+        "session_id": "frontend-session-1",
+        "history": history[-6:],
+    }
+    resp = requests.post(API_URL, json=payload, timeout=120)
+    resp.raise_for_status()
+    return resp.json()
 
-# Botón para enviar la consulta
-if st.button("Enviar Consulta ➡️", type="primary"):
+def normalize_response(data: Dict[str, Any]) -> Dict[str, Any]:
+    # Backend real
+    if "answer" in data:
+        return {"answer": data.get("answer", ""), "sources": data.get("sources", [])}
+    # Mock antiguo
+    if "respuesta" in data:
+        return {"answer": data.get("respuesta", ""), "sources": data.get("referencias", [])}
+    return {"answer": "No se encontró respuesta.", "sources": []}
+
+# =========================
+# UI mínima
+# =========================
+with st.form("ask_form", clear_on_submit=False):
+    question = st.text_input("Tu pregunta:", placeholder="Ej: ¿Qué documentos necesito para ...?")
+    submitted = st.form_submit_button("Enviar")
+
+if submitted:
     if not question:
-        st.warning("Por favor, ingresa una pregunta para continuar.")
+        st.warning("Escribe una pregunta.")
     else:
-        # Indicador de carga
-        with st.spinner('Consultando al Agente Pandero...'):
-            data = None
-            
-            if SIMULATION_MODE:
-                data = mock_api_response(question)
-            else:
-                # Lógica para la API real (se ejecuta solo si SIMULATION_MODE = False)
-                try:
-                    resp = requests.post(API_URL, json={"question": question})
-                    resp.raise_for_status()
-                    data = resp.json()
-                except requests.exceptions.ConnectionError:
-                    st.error(f"⚠️ Error de conexión: No se pudo conectar al servidor en {API_URL}.")
-                    st.caption("Asegúrate de que tu aplicación FastAPI esté corriendo en el puerto 8000.")
-                except requests.exceptions.HTTPError as e:
-                    st.error(f"❌ Error del servidor (HTTP): {e}")
-                except Exception as e:
-                    st.error(f"🚨 Ocurrió un error inesperado: {e}")
-            
-            # --- Renderizar la Respuesta ---
-            if data:
-                st.subheader("✅ Respuesta del Agente:")
-                
-                respuesta = data.get("respuesta", "No se encontró respuesta en el formato esperado.")
-                st.markdown(f'<div style="background-color: {PANDERO_LIGHT_BLUE}; padding: 15px; border-radius: 10px; border-left: 5px solid {PANDERO_BLUE};">{respuesta}</div>', unsafe_allow_html=True)
-                
-                referencias = data.get("referencias")
-                if referencias:
-                    st.subheader("📚 Referencias/Fuentes:")
-                    st.json(referencias)
-                else:
-                    st.caption("No se proporcionaron fuentes para esta respuesta.")
+        st.session_state.messages.append({"role": "user", "content": question})
+        try:
+            raw = mock_api_response(question) if SIMULATION_MODE else call_backend(question, st.session_state.messages)
+            data = normalize_response(raw)
+            st.session_state.messages.append({"role": "assistant", "content": data["answer"]})
+        except requests.exceptions.ConnectionError:
+            st.error(f"No se pudo conectar a {API_URL}. ¿El backend está corriendo?")
+        except requests.exceptions.HTTPError as e:
+            st.error(f"Error HTTP: {e}")
+            try:
+                st.json(raw)  # si llegó JSON de error
+            except Exception:
+                pass
+        except Exception as e:
+            st.error(f"Error inesperado: {e}")
 
-# Pie de página o instrucciones
-st.markdown("---")
-if SIMULATION_MODE:
-    st.caption("🟢 **MODO SIMULACIÓN ACTIVO.** Ejecuta el backend y cambia `SIMULATION_MODE = False` para la conexión real.")
-else:
-    st.caption(f"🔴 Conectando a la API real en: `{API_URL}`")
+# Mostrar conversación
+st.divider()
+st.subheader("Conversación")
+for m in st.session_state.messages:
+    speaker = "Tú" if m["role"] == "user" else "Agente"
+    st.markdown(f"**{speaker}:** {m['content']}")
+
+# Controles rápidos
+col1, col2 = st.columns(2)
+with col1:
+    if st.button("Limpiar chat"):
+        st.session_state.messages = []
+        st.rerun()
+with col2:
+    st.toggle("Modo simulación", value=SIMULATION_MODE, key="sim_flag", help="Si se activa, no llama al backend.")
+    # Nota: si cambias este toggle, re-lanza la app o úsalo para setear SIMULATION_MODE global.
